@@ -1,0 +1,143 @@
+import { config as dotenv } from "dotenv";
+import {
+  createWalletClient,
+  http,
+  getContract,
+  erc20Abi,
+  parseUnits,
+  maxUint256,
+  publicActions,
+  concat,
+  numberToHex,
+  size,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { scroll } from "viem/chains";
+import { wethAbi } from "./abi/weth-abi";
+
+// Charger les variables d'environnement
+dotenv();
+const { PRIVATE_KEY, ZERO_EX_API_KEY, ALCHEMY_HTTP_TRANSPORT_URL } = process.env;
+
+// Valider la présence des variables d'environnement
+if (!PRIVATE_KEY || !ZERO_EX_API_KEY || !ALCHEMY_HTTP_TRANSPORT_URL) {
+  throw new Error("Variables d'environnement manquantes.");
+}
+
+// Configurer les en-têtes
+const headers = {
+  "Content-Type": "application/json",
+  "0x-api-key": ZERO_EX_API_KEY,
+  "0x-version": "v2",
+};
+
+// Créer le client du portefeuille
+const client = createWalletClient({
+  account: privateKeyToAccount(`0x${PRIVATE_KEY}` as `0x${string}`),
+  chain: scroll,
+  transport: http(ALCHEMY_HTTP_TRANSPORT_URL),
+}).extend(publicActions);
+
+const [address] = await client.getAddresses();
+
+// Définir les contrats WETH et ERC20
+const weth = getContract({
+  address: "0x5300000000000000000000000000000000000004",
+  abi: wethAbi,
+  client,
+});
+
+const wsteth = getContract({
+  address: "0xf610A9dfB7C89644979b4A0f27063E9e7d7Cda32",
+  abi: erc20Abi,
+  client,
+});
+
+// Fonction pour afficher les sources de liquidité
+function displayLiquiditySources(route: any) {
+  route.fills.forEach((fill: any) => {
+    console.log(`${fill.source}: ${(parseInt(fill.proportionBps) / 100).toFixed(2)}%`);
+  });
+}
+
+// Fonction pour afficher les taxes d'achat/vente des tokens
+function displayTokenTaxes(tokenMetadata: any) {
+  ["buyToken", "sellToken"].forEach((token) => {
+    const buyTax = (parseInt(tokenMetadata[token].buyTaxBps) / 100).toFixed(2);
+    const sellTax = (parseInt(tokenMetadata[token].sellTaxBps) / 100).toFixed(2);
+    if (buyTax > 0 || sellTax > 0) {
+      console.log(`${token} Buy Tax: ${buyTax}%, Sell Tax: ${sellTax}%`);
+    }
+  });
+}
+
+// Fonction pour récupérer et afficher toutes les sources de liquidité
+async function getLiquiditySources() {
+  const chainId = client.chain.id.toString();
+  const response = await fetch(`https://api.0x.org/swap/v1/sources?chainId=${chainId}`, { headers });
+  const data = await response.json();
+  console.log("Sources de liquidité:", Object.keys(data.sources).join(", "));
+}
+
+// Fonction principale
+async function main() {
+  await getLiquiditySources();
+
+  const decimals = await weth.read.decimals() as number;
+  const sellAmount = parseUnits("0.1", decimals);
+  const priceParams = new URLSearchParams({
+    chainId: client.chain.id.toString(),
+    sellToken: weth.address,
+    buyToken: wsteth.address,
+    sellAmount: sellAmount.toString(),
+    taker: client.account.address,
+    affiliateFee: "100", // 1%
+    surplusCollection: "true",
+  });
+
+  const priceResponse = await fetch(`https://api.0x.org/swap/permit2/price?${priceParams.toString()}`, { headers });
+  const price = await priceResponse.json();
+  console.log("Prix:", price);
+
+  if (price.issues.allowance) {
+    const { request } = await weth.simulate.approve([price.issues.allowance.spender, maxUint256]);
+    console.log("Approbation de WETH en cours...", request);
+    const hash = await weth.write.approve(request.args);
+    console.log("Approbation réussie.", await client.waitForTransactionReceipt({ hash }));
+  }
+
+  const quoteResponse = await fetch(`https://api.0x.org/swap/permit2/quote?${priceParams.toString()}`, { headers });
+  const quote = await quoteResponse.json();
+  console.log("Quote:", quote);
+
+  if (quote.route) displayLiquiditySources(quote.route);
+  if (quote.tokenMetadata) displayTokenTaxes(quote.tokenMetadata);
+  if (quote.affiliateFeeBps) {
+    console.log(`Frais d'affiliation: ${(parseInt(quote.affiliateFeeBps) / 100).toFixed(2)}%`);
+  }
+  if (quote.tradeSurplus) console.log(`Surplus de trading: ${quote.tradeSurplus}`);
+
+  if (quote.permit2?.eip712) {
+    const signature = await client.signTypedData(quote.permit2.eip712);
+    if (signature && quote?.transaction?.data) {
+      const signatureLengthInHex = numberToHex(size(signature), { signed: false, size: 32 });
+      quote.transaction.data = concat([quote.transaction.data, signatureLengthInHex, signature]);
+
+      const nonce = await client.getTransactionCount({ address: client.account.address });
+      const signedTransaction = await client.signTransaction({
+        account: client.account,
+        chain: client.chain,
+        gas: BigInt(quote.transaction.gas || 0),
+        to: quote.transaction.to,
+        data: quote.transaction.data,
+        value: BigInt(quote.transaction.value || 0),
+        gasPrice: BigInt(quote.transaction.gasPrice || 0),
+        nonce,
+      });
+      const hash = await client.sendRawTransaction({ serializedTransaction: signedTransaction });
+      console.log(`Transaction envoyée: https://scrollscan.com/tx/${hash}`);
+    }
+  }
+}
+
+main();
